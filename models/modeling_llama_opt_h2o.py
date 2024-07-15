@@ -1,4 +1,4 @@
-# coding=utf-8rad
+# coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -58,7 +58,7 @@ from transformers.models.llama.modeling_llama import (
     logger
 )
 
-from .configuration_llama import OptLlamaConfig
+from .configuration_llama import H2OLlamaConfig
 
 def apply_rotary_pos_emb_q(q, cos, sin, position_ids, unsqueeze_dim=1):
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
@@ -79,7 +79,7 @@ class LlamaAttentionBase(_LlamaAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper
     It behaves exactly the same as its parent, we just add an input encoder_outputs."""
 
-    def __init__(self, config: OptLlamaConfig):
+    def __init__(self, config: H2OLlamaConfig):
         """
         H2O related variables
         """
@@ -134,7 +134,14 @@ class LlamaAttentionBase(_LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        print(f"kv_seq_len: {kv_seq_len}")
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        print(f"query_states.shape: {query_states.shape}")
+        print(f"key_states.shape: {key_states.shape}")
+        print(f"cos.shape: {cos.shape}")
+        print(f"sin.shape: {sin.shape}")
+        print(f"position_ids.shape: {position_ids.shape}")
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -816,7 +823,7 @@ class LlamaAttention(LlamaAttentionBase):
 
 
 class LlamaFlashAttention2(LlamaFlashAttention2Base):
-    def __init__(self, config: OptLlamaConfig):
+    def __init__(self, config: H2OLlamaConfig):
         super().__init__(config)
         self.heavy_budget_ratio = config.heavy_ratio
         self.recent_budget_ratio = config.recent_ratio
@@ -1209,7 +1216,7 @@ class LlamaFlashAttention2Middle(LlamaFlashAttention2):
 
 
 class LlamaDecoderLayer(_LlamaDecoderLayer):
-    def __init__(self, config: OptLlamaConfig, layer_idx: int):
+    def __init__(self, config: H2OLlamaConfig, layer_idx: int):
         super(_LlamaDecoderLayer, self).__init__()
         self.hidden_size = config.hidden_size
         attn_cls = self._get_attn_cls(config, layer_idx)
@@ -1218,7 +1225,7 @@ class LlamaDecoderLayer(_LlamaDecoderLayer):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     
-    def _get_attn_cls(self, config: OptLlamaConfig, layer_idx: int):
+    def _get_attn_cls(self, config: H2OLlamaConfig, layer_idx: int):
         layer_types = [int(x) for x in config.layer_types.split("_")]
         layer_type = layer_types[layer_idx]
 
@@ -1310,11 +1317,11 @@ class LlamaModel(_LlamaModel):
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
     Args:
-        config: OptLlamaConfig
+        config: H2OLlamaConfig
     """
-    config_class = OptLlamaConfig
+    config_class = H2OLlamaConfig
 
-    def __init__(self, config: OptLlamaConfig):
+    def __init__(self, config: H2OLlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1521,7 +1528,7 @@ class LlamaModel(_LlamaModel):
 
 
 class LlamaForCausalLM(_LlamaForCausalLM):
-    config_class = OptLlamaConfig
+    config_class = H2OLlamaConfig
 
     def __init__(self, config):
         super(_LlamaForCausalLM, self).__init__(config)

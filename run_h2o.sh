@@ -18,10 +18,10 @@ export LCKV_FUSED_SWIGLU=1
 #  - to intialize the model with a pretrained model, add `--model_name_or_path TinyLlama/TinyLlama-1.1B-intermediate-step-1195k-token-2.5T`
 #  - to use the minipile dataset, use `--dataset_name JeanKaddour/minipile`, with proper `--preprocessing_num_workers`
 #  - to enable wandb, use `--report_to wandb`
-accelerate launch run_clm.py \
+accelerate launch --num_processes=1 run_clm.py \
     --tokenizer_name TinyLlama/TinyLlama-1.1B-intermediate-step-955k-token-2T \
     --config_name configs/llama_opt_h2o.json \
-    --config_overrides model_type=h2o-llama,num_encoders=8,num_trained_encoders=1,layer_types=0_1_1_1_1_1_2_0,target_layer=-2,train_kv=false \
+    --config_overrides model_type=h2o-llama,num_encoders=8,num_trained_encoders=1,layer_types=0_1_1_1_1_1_2_0,target_layer=-2,train_kv=false,num_hidden_layers=8 \
     --dataset_name wikitext \
     --dataset_config_name wikitext-103-raw-v1 \
     --per_device_train_batch_size 32 \

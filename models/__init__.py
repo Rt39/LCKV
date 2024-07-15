@@ -5,12 +5,13 @@ from .wandb_callback import WandbCallback
 
 from .modeling_llama_cla import LlamaForCausalLM as ClaLlamaForCausalLM
 from .configuration_llama import ClaLlamaConfig
+from .configuration_llama import H2OLlamaConfig
 
 from transformers import AutoConfig, AutoModelForCausalLM
 AutoConfig.register("opt-llama", OptLlamaConfig)
 AutoModelForCausalLM.register(OptLlamaConfig, OptLlamaForCausalLM)
-AutoConfig.register("h2o-llama", OptLlamaConfig)
-AutoModelForCausalLM.register(H2OLlamaForCausalLM, H2OLlamaForCausalLM)
+AutoConfig.register("h2o-llama", H2OLlamaConfig)
+AutoModelForCausalLM.register(H2OLlamaConfig, H2OLlamaForCausalLM)
 AutoConfig.register("cla-llama", ClaLlamaConfig)
 AutoModelForCausalLM.register(ClaLlamaConfig, ClaLlamaForCausalLM)
 
