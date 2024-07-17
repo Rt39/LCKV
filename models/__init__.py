@@ -25,6 +25,8 @@ if os.environ.get('LCKV_FUSED_RMSNORM', False):
     modeling_llama_opt.LlamaRMSNorm = RMSNorm
     from . import modeling_llama_cla
     modeling_llama_cla.LlamaRMSNorm = RMSNorm
+    from . import modeling_llama_opt_h2o
+    modeling_llama_opt_h2o.LlamaRMSNorm = RMSNorm
 
 if os.environ.get('LCKV_FUSED_CROSSENTROPY', False):
     import transformers
@@ -34,6 +36,8 @@ if os.environ.get('LCKV_FUSED_CROSSENTROPY', False):
     modeling_llama_opt.CrossEntropyLoss = CrossEntropyLoss
     from . import modeling_llama_cla
     modeling_llama_cla.CrossEntropyLoss = CrossEntropyLoss
+    from . import modeling_llama_opt_h2o
+    modeling_llama_opt_h2o.CrossEntropyLoss = CrossEntropyLoss
 
 if os.environ.get('LCKV_FUSED_ROTARY', False):
     import transformers
@@ -60,6 +64,10 @@ if os.environ.get('LCKV_FUSED_ROTARY', False):
     modeling_llama_cla.apply_rotary_pos_emb = fused_apply_rotary_pos_emb
     modeling_llama_cla.apply_rotary_pos_emb_q = fused_apply_rotary_pos_emb_q
 
+    from . import modeling_llama_opt_h2o
+    modeling_llama_opt_h2o.apply_rotary_pos_emb = fused_apply_rotary_pos_emb
+    modeling_llama_opt_h2o.apply_rotary_pos_emb_q = fused_apply_rotary_pos_emb_q
+
 if os.environ.get('LCKV_FUSED_SWIGLU', False):
     import transformers
     from .llama_fused_swiglu import LlamaMLP
@@ -68,6 +76,8 @@ if os.environ.get('LCKV_FUSED_SWIGLU', False):
     modeling_llama_opt.LlamaMLP = LlamaMLP
     from . import modeling_llama_cla
     modeling_llama_cla.LlamaMLP = LlamaMLP
+    from . import modeling_llama_opt_h2o
+    modeling_llama_opt_h2o.LlamaMLP = LlamaMLP
 
 try:
     from streaming_llm import enable_streaming_llm

@@ -134,14 +134,8 @@ class LlamaAttentionBase(_LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        print(f"kv_seq_len: {kv_seq_len}")
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        print(f"query_states.shape: {query_states.shape}")
-        print(f"key_states.shape: {key_states.shape}")
-        print(f"cos.shape: {cos.shape}")
-        print(f"sin.shape: {sin.shape}")
-        print(f"position_ids.shape: {position_ids.shape}")
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:

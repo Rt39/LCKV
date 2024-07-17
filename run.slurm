@@ -2,13 +2,14 @@
 
 #SBATCH --job-name=GPU
 #SBATCH --partition=normal
-#SBATCH -n 2
-#SBATCH --ntasks-per-node=2
-#SBATCH --gres=gpu:2
+#SBATCH -n 4
+#SBATCH --ntasks-per-node=4
+#SBATCH --gres=gpu:4
 #SBATCH --mail-type=end
 #SBATCH --mail-user=hwwysong@gmail.com
-#SBATCH --output=%j.out
-#SBATCH --error=%j.err
+#SBATCH --output=outputs/%j.out
+#SBATCH --error=outputs/%j.err
+#SBATCH --time 2-12:00:00
 
 HF_ENDPOINT=https://hf-mirror.com
 
