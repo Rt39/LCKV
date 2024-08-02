@@ -17,27 +17,27 @@ AutoModelForCausalLM.register(ClaLlamaConfig, ClaLlamaForCausalLM)
 
 import os
 
-if os.environ.get('LCKV_FUSED_RMSNORM', False):
-    import transformers
-    from flash_attn.ops.rms_norm import RMSNorm
-    transformers.models.llama.modeling_llama.LlamaRMSNorm = RMSNorm
-    from . import modeling_llama_opt
-    modeling_llama_opt.LlamaRMSNorm = RMSNorm
-    from . import modeling_llama_cla
-    modeling_llama_cla.LlamaRMSNorm = RMSNorm
-    from . import modeling_llama_opt_h2o
-    modeling_llama_opt_h2o.LlamaRMSNorm = RMSNorm
+# if os.environ.get('LCKV_FUSED_RMSNORM', False):
+#     import transformers
+#     from flash_attn.ops.rms_norm import RMSNorm
+#     transformers.models.llama.modeling_llama.LlamaRMSNorm = RMSNorm
+#     from . import modeling_llama_opt
+#     modeling_llama_opt.LlamaRMSNorm = RMSNorm
+#     from . import modeling_llama_cla
+#     modeling_llama_cla.LlamaRMSNorm = RMSNorm
+#     from . import modeling_llama_opt_h2o
+#     modeling_llama_opt_h2o.LlamaRMSNorm = RMSNorm
 
-if os.environ.get('LCKV_FUSED_CROSSENTROPY', False):
-    import transformers
-    from flash_attn.losses.cross_entropy import CrossEntropyLoss
-    transformers.models.llama.modeling_llama.CrossEntropyLoss = CrossEntropyLoss
-    from . import modeling_llama_opt
-    modeling_llama_opt.CrossEntropyLoss = CrossEntropyLoss
-    from . import modeling_llama_cla
-    modeling_llama_cla.CrossEntropyLoss = CrossEntropyLoss
-    from . import modeling_llama_opt_h2o
-    modeling_llama_opt_h2o.CrossEntropyLoss = CrossEntropyLoss
+# if os.environ.get('LCKV_FUSED_CROSSENTROPY', False):
+#     import transformers
+#     from flash_attn.losses.cross_entropy import CrossEntropyLoss
+#     transformers.models.llama.modeling_llama.CrossEntropyLoss = CrossEntropyLoss
+#     from . import modeling_llama_opt
+#     modeling_llama_opt.CrossEntropyLoss = CrossEntropyLoss
+#     from . import modeling_llama_cla
+#     modeling_llama_cla.CrossEntropyLoss = CrossEntropyLoss
+#     from . import modeling_llama_opt_h2o
+#     modeling_llama_opt_h2o.CrossEntropyLoss = CrossEntropyLoss
 
 if os.environ.get('LCKV_FUSED_ROTARY', False):
     import transformers

@@ -19,6 +19,7 @@
 # limitations under the License.
 """ PyTorch LLaMA model."""
 import os
+import sys
 import math
 import warnings
 from tqdm import trange
@@ -47,8 +48,6 @@ from transformers.models.llama.modeling_llama import (
     LlamaForCausalLM as _LlamaForCausalLM,
     LlamaDecoderLayer as _LlamaDecoderLayer,
     LlamaAttention as _LlamaAttention,
-    LlamaFlashAttention2 as _LlamaFlashAttention2,
-    _prepare_4d_causal_attention_mask,
     LlamaMLP,
     LlamaRMSNorm,
     repeat_kv,
@@ -75,6 +74,105 @@ class DummyContext:
 
 dummy_context = DummyContext()
 
+
+class H2OKVCache(nn.Module):
+    """
+    H2O code for evicting the KV cache,
+    computes the HH score and selects the HH and recent tokens
+    to evict past_key_values
+    """
+
+    def __init__(
+            self,
+            hh_ratio: float,
+            recent_ratio: float,
+            hh_fixed_size: int = 1,
+            recent_fixed_size: int = 1,
+        ):
+        super().__init__()
+        self.hh_score = None
+        self.hh_ratio = hh_ratio
+        self.recent_ratio = recent_ratio
+        self.hh_fixed_size = hh_fixed_size
+        self.recent_fixed_size = recent_fixed_size
+
+    def forward(
+            self,
+            past_key_values: Optional[Tuple[torch.FloatTensor]],
+            attn_score_cache: torch.Tensor
+            ) -> Optional[Tuple[torch.Tensor]]:
+        """
+        Args:
+            past_key_values: A tuple of (key_states, value_states)
+                key_states: torch.FloatTensor of shape (batch_size, num_heads, seq_len, head_dim)
+                value_states: torch.FloatTensor of shape (batch_size, num_heads, seq_len, head_dim)
+            attn_score_cache: torch.Tensor of shape (batch_size, num_heads, query_states, seq_len)
+        """
+        if past_key_values is None:
+            return None
+        
+        key_states, value_states = past_key_values
+
+        bsz, num_heads, _, head_dim = key_states.shape
+        num_groups = attn_score_cache.shape[1] // num_heads
+
+        self._update_hh_score(num_groups, attn_score_cache)
+
+        seq_len = key_states.size(2) -1
+
+        hh_size = int(self.hh_ratio * seq_len) + self.hh_fixed_size
+        recent_size = int(self.recent_ratio * seq_len) + self.recent_fixed_size
+        if seq_len <= hh_size + recent_size:
+            return past_key_values
+
+        select_hh_scores = self.hh_score[:, :seq_len - recent_size]
+        _, keep_topk = torch.topk(select_hh_scores, hh_size, dim=-1)   # indices of topk
+        keep_topk = keep_topk.sort().values
+
+        keep_recent = torch.arange(seq_len - recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)  # indices of recent
+        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)  # indices to keep
+
+        mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
+        mask = mask.scatter(-1, keep_idx, 1)
+
+        key_states_last = key_states[:, :, -1, :]
+        value_states_last = value_states[:, :, -1, :]
+
+        key_states = key_states[:, :, :-1, :].squeeze()
+        value_states = value_states[:, :, :-1, :].squeeze()
+
+        # select hh and recent tokens for key and value
+        k_hh_recent = []
+        v_hh_recent = []
+        for i in range(key_states.size(0)):
+            k_hh_recent.append(key_states[i][mask[i]])
+            v_hh_recent.append(value_states[i][mask[i]])
+        k_hh_recent = torch.stack(k_hh_recent).view(bsz, num_heads, -1, head_dim)
+        v_hh_recent = torch.stack(v_hh_recent).view(bsz, num_heads, -1, head_dim)
+
+        k_hh_recent = torch.cat([k_hh_recent, key_states_last.unsqueeze(2)], dim=2)
+        v_hh_recent = torch.cat([v_hh_recent, value_states_last.unsqueeze(2)], dim=2)
+
+        hh_score = []
+        for i in range(self.hh_score.size(0)):
+            hh_score.append(self.hh_score[i][mask[i]])
+        self.hh_score = torch.stack(hh_score)
+
+        return (k_hh_recent, v_hh_recent)
+    
+    def _update_hh_score(self, num_groups: int, attn_score_cache: torch.Tensor):
+
+        bsz, num_heads, num_new_tokens, _ = attn_score_cache.shape
+        assert bsz == 1
+
+        attn_score_cache = attn_score_cache.sum(0).sum(1).reshape(num_heads // num_groups, num_groups, -1).sum(1)
+
+        if self.hh_score is None:
+            self.hh_score = attn_score_cache
+        else:
+            attn_score_cache[:, :-num_new_tokens] += self.hh_score
+            self.hh_score = attn_score_cache
+
 class LlamaAttentionBase(_LlamaAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper
     It behaves exactly the same as its parent, we just add an input encoder_outputs."""
@@ -86,13 +184,7 @@ class LlamaAttentionBase(_LlamaAttention):
         super().__init__(config)
         self.heavy_budget_ratio = config.heavy_ratio
         self.recent_budget_ratio = config.recent_ratio
-        self.attention_masks_next = None 
-        self.heavy_budget = None
-        self.recent_budget = None
-        self.cache_budget = None
-        self.previous_scores = None
-        self.input_length = []
-        self.cache_budget_records = []
+        self.kv_cache_evict = H2OKVCache(config.heavy_ratio, config.recent_ratio)
 
     def _get_qkv(
         self,
@@ -135,7 +227,6 @@ class LlamaAttentionBase(_LlamaAttention):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -328,63 +419,11 @@ class LlamaAttentionBase(_LlamaAttention):
                 )
             attn_weights = attn_weights + attention_mask[:, :, :, 1:]
 
-        # get the last attention mask
-        if self.attention_masks_next is not None:
-            # set the attention mask to 0 for the last token
-            attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
-
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-
-
-#region H2O
-
-        # attn_weights (BS, heads, q-tokens, k-tokens) 16, 15, 15 // 16, 1, 16
-        current_scores_sum = attn_weights.sum(0).sum(1) # (heads, k-tokens)
-        # offset = attn_weights.gt(0).sum(0).sum(1)
-
-        # Accumulate attention scores
-        if not self.previous_scores == None:
-            current_scores_sum[:, :-1] += self.previous_scores #(Enlarged Sequence)
-        else:
-            self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
-            self.recent_budget = int(self.recent_budget_ratio * current_scores_sum.shape[-1])
-            self.cache_budget = self.heavy_budget + self.recent_budget
-            self.cache_budget_records.append(self.cache_budget)
-            self.input_length.append(attn_weights.shape[-1])
-
-        assert attn_weights.shape[0] == 1   # Only support batch size 1
-        self.previous_scores = current_scores_sum # (heads, k-tokens)
-        attn_mask = torch.ones(current_scores_sum.shape[0],
-                               current_scores_sum.shape[1]+1,
-                               ).to(attn_weights.dtype).to(attn_weights.device)
-        
-        attn_tokens_all = self.previous_scores.shape[-1]
-
-        if attn_tokens_all > self.cache_budget:  # Cache is full
-            # activate most recent k-tokens
-            if not self.recent_budget == 0:
-                # Set the attn_mask to 0 for the most recent tokens
-                attn_mask[:, -self.recent_budget:] = 0
-                selected_tokens = self.previous_scores[:, :-self.recent_budget]
-            else:
-                attn_mask[:, :] = 0 # No recent tokens
-                selected_tokens = self.previous_scores
-
-            if not self.heavy_budget == 0:
-                # select top k tokens
-                _, keep_topk = selected_tokens.topk(k=self.heavy_budget, dim=-1, largest=True)
-                attn_mask = attn_mask.scatter(-1, keep_topk, 1)
-
-        self.attention_masks_next = attn_mask.clone().unsqueeze(0).unsqueeze(2)
-
-        score_mask = attn_mask[:,:-1]
-        score_mask[:, -self.recent_budget:] = 1
-        self.previous_scores = self.previous_scores * score_mask
-        
-        
-#endregion
+        # H2O
+        past_key_value = self.kv_cache_evict(past_key_value, attn_weights.detach().clone())
 
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -410,425 +449,7 @@ class LlamaAttentionBase(_LlamaAttention):
         return attn_output, attn_weights, past_key_value
     
 
-class LlamaFlashAttention2Base(_LlamaFlashAttention2):
-    """
-    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    It behaves exactly the same as its parent, we just add an input encoder_outputs.
-    """
-
-    def _get_qkv(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-        
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        # remove the last token
-        key_states = key_states[:, :, :-1, :]
-        value_states = value_states[:, :, :-1, :]
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # LlamaFlashAttention2 attention does not support output_attentions
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-
-            # overwrite attention_mask with padding_mask
-            attention_mask = kwargs.pop("padding_mask")
-
-        output_attentions = False
-        
-        bsz, q_len, _ = hidden_states.size()
-        if past_key_value is not None:
-            kv_seq_len = q_len + past_key_value[0].shape[-2]
-        else:
-            kv_seq_len = q_len
-
-        if q_len == 1 and kv_seq_len == 1:
-            forward_func = self._forward_dummy
-        elif q_len == kv_seq_len:
-            forward_func = self._forward_training
-        else:
-            forward_func = self._forward_decoding
-
-        return forward_func(
-            hidden_states,
-            attention_mask,
-            position_ids,
-            past_key_value,
-            encoder_outputs,
-            output_attentions,
-            use_cache,
-            **kwargs,
-        )
-    
-    def _forward_dummy(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        if use_cache:
-            query_states, key_states, value_states, kv_seq_len, past_key_value = self._get_qkv(
-                hidden_states,
-                position_ids,
-                past_key_value,
-                encoder_outputs,
-                use_cache,
-                **kwargs
-            )
-
-        attn_output = torch.zeros_like(hidden_states)
-
-        return attn_output, None, past_key_value
-
-    def _forward_training(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states, key_states, value_states, kv_seq_len, past_key_value = self._get_qkv(
-            hidden_states,
-            position_ids,
-            past_key_value,
-            encoder_outputs,
-            use_cache,
-            **kwargs
-        )
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        # TODO: llama does not have dropout in the config??
-        # It is recommended to use dropout with FA according to the docs
-        # when training.
-        dropout_rate = 0.0  # if not self.training else self.attn_dropout
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (LlamaRMSNorm handles it correctly)
-
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            # Handle the case where the model is quantized
-            if hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-        
-        query_states = query_states[:, 1:, :, :]
-
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len-1, dropout=dropout_rate
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len-1, self.hidden_size)
-        attn_output = torch.cat([torch.zeros(bsz, 1, self.hidden_size, dtype=attn_output.dtype, device=attn_output.device), attn_output], dim=1)
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-    
-    def _forward_decoding(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states, key_states, value_states, kv_seq_len, past_key_value = self._get_qkv(
-            hidden_states,
-            position_ids,
-            past_key_value,
-            encoder_outputs,
-            use_cache,
-            **kwargs
-        )
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        # TODO: llama does not have dropout in the config??
-        # It is recommended to use dropout with FA according to the docs
-        # when training.
-        dropout_rate = 0.0  # if not self.training else self.attn_dropout
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (LlamaRMSNorm handles it correctly)
-
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            # Handle the case where the model is quantized
-            if hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
 class LlamaAttention(LlamaAttentionBase):
-    def _get_qkv(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        if encoder_outputs is not None and past_key_value is not None:
-            output = self._get_qkv_encoder_and_cache(
-                hidden_states,
-                position_ids,
-                past_key_value,
-                encoder_outputs,
-                use_cache,
-                **kwargs
-            )
-        elif encoder_outputs is not None:
-            output = self._get_qkv_encoder(
-                hidden_states,
-                position_ids,
-                None,
-                encoder_outputs,
-                use_cache,
-                **kwargs
-            )
-        else:
-            output = self._get_qkv_cache(
-                hidden_states,
-                position_ids,
-                past_key_value,
-                None,
-                use_cache,
-                **kwargs
-            )
-        return output
-    
-    def _get_qkv_cache(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        return super()._get_qkv(
-            hidden_states,
-            position_ids,
-            past_key_value,
-            None,
-            use_cache,
-            **kwargs
-        )
-
-    def _get_qkv_encoder(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        """It will deal with encoder_outputs differently from its parent."""
-        assert past_key_value is None
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        key_states, value_states = encoder_outputs
-
-        kv_seq_len = key_states.shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_q(query_states, cos, sin, position_ids)
-
-        if use_cache:
-            _key_states = self.k_proj(hidden_states)
-            _value_states = self.v_proj(hidden_states)
-            _key_states = _key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            _value_states = _value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            _key_states = apply_rotary_pos_emb_q(_key_states, cos, sin, position_ids)
-            past_key_value = (_key_states, _value_states)
-        else:
-            past_key_value = None
-        
-        # remove the last token
-        key_states = key_states[:, :, :-1, :]
-        value_states = value_states[:, :, :-1, :]
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-    
-    def _get_qkv_encoder_and_cache(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        """Combine the kv from cache and encoder outputs"""
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        key_states, value_states = encoder_outputs
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_q(query_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        
-        if use_cache:
-            _key_states = self.k_proj(hidden_states)
-            _value_states = self.v_proj(hidden_states)
-            _key_states = _key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            _value_states = _value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            cos, sin = self.rotary_emb(_value_states, seq_len=kv_seq_len)
-            _key_states = apply_rotary_pos_emb_q(_key_states, cos, sin, position_ids)
-            past_key_value = (_key_states, _value_states)
-        else:
-            past_key_value = None
-        
-        # remove the last token
-        key_states = key_states[:, :, :-1, :]
-        value_states = value_states[:, :, :-1, :]
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-
-
-class LlamaFlashAttention2(LlamaFlashAttention2Base):
-    def __init__(self, config: H2OLlamaConfig):
-        super().__init__(config)
-        self.heavy_budget_ratio = config.heavy_ratio
-        self.recent_budget_ratio = config.recent_ratio
-        self.attention_masks_next = None 
-        self.heavy_budget = None
-        self.recent_budget = None
-        self.cache_budget = None
-        self.previous_scores = None
-        self.input_length = []
-        self.cache_budget_records = []
-
     def _get_qkv(
         self,
         hidden_states: torch.Tensor,
@@ -983,125 +604,9 @@ class LlamaAttentionMiddle(LlamaAttention):
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        self._init_rope()
-    
-    def _get_qkv_cache(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = q_len
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_q(query_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states, value_states = past_key_value
-        else:
-            key_states = value_states = torch.zeros(bsz, self.num_key_value_heads, q_len-1, self.head_dim, dtype=query_states.dtype, device=query_states.device)
-
-        past_key_value = None
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-
-    def _get_qkv_encoder(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        """It will deal with encoder_outputs differently from its parent."""
-        assert past_key_value is None
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        key_states, value_states = encoder_outputs
-
-        kv_seq_len = key_states.shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_q(query_states, cos, sin, position_ids)
-
-        past_key_value = None
-        
-        # remove the last token
-        key_states = key_states[:, :, :-1, :]
-        value_states = value_states[:, :, :-1, :]
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-    
-    def _get_qkv_encoder_and_cache(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        """Combine the kv from cache and encoder outputs"""
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        key_states, value_states = encoder_outputs
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states = apply_rotary_pos_emb_q(query_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        
-        past_key_value = None
-        
-        # remove the last token
-        key_states = key_states[:, :, :-1, :]
-        value_states = value_states[:, :, :-1, :]
-
-        return query_states, key_states, value_states, kv_seq_len, past_key_value
-
-
-class LlamaFlashAttention2Middle(LlamaFlashAttention2):
-    def __init__(self, config):
-        """Remove the key value projection."""
-        super(_LlamaAttention, self).__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.heavy_budget_ratio = config.heavy_ratio
+        self.recent_budget_ratio = config.recent_ratio
+        self.kv_cache_evict = H2OKVCache(config.heavy_ratio, config.recent_ratio)
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -1207,7 +712,6 @@ class LlamaFlashAttention2Middle(LlamaFlashAttention2):
         value_states = value_states[:, :, :-1, :]
 
         return query_states, key_states, value_states, kv_seq_len, past_key_value
-
 
 class LlamaDecoderLayer(_LlamaDecoderLayer):
     def __init__(self, config: H2OLlamaConfig, layer_idx: int):
@@ -1223,24 +727,14 @@ class LlamaDecoderLayer(_LlamaDecoderLayer):
         layer_types = [int(x) for x in config.layer_types.split("_")]
         layer_type = layer_types[layer_idx]
 
-        if not getattr(config, "_flash_attn_2_enabled", False):
-            if layer_type == 0:
-                return LlamaAttentionBase
-            elif layer_type == 1:
-                return LlamaAttentionMiddle
-            elif layer_type == 2:
-                return LlamaAttention
-            else:
-                raise ValueError(f"Unknwon layer type: {layer_type}")
+        if layer_type == 0:
+            return LlamaAttentionBase
+        elif layer_type == 1:
+            return LlamaAttentionMiddle
+        elif layer_type == 2:
+            return LlamaAttention
         else:
-            if layer_type == 0:
-                return LlamaFlashAttention2Base
-            elif layer_type == 1:
-                return LlamaFlashAttention2Middle
-            elif layer_type == 2:
-                return LlamaFlashAttention2
-            else:
-                raise ValueError(f"Unknwon layer type: {layer_type}")
+            raise ValueError(f"Unknwon layer type: {layer_type}")
 
     def forward(
         self,
@@ -1257,7 +751,7 @@ class LlamaDecoderLayer(_LlamaDecoderLayer):
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
             attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                attention mask of size `(batch_size, 1,
                 query_sequence_length, key_sequence_length)` if default attention is used.
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
@@ -1407,14 +901,9 @@ class LlamaModel(_LlamaModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if getattr(self.config, "_flash_attn_2_enabled", False):
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-            )
+        attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+        if attention_mask is not None:
+            attention_mask.unsqueeze_(0).unsqueeze_(1)
 
         # embed positions
         hidden_states = inputs_embeds

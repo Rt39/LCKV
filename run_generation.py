@@ -50,7 +50,7 @@ from transformers import (
     XLNetTokenizer,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from models import OptLlamaForCausalLM, ClaLlamaForCausalLM
+from models import OptLlamaForCausalLM, ClaLlamaForCausalLM, H2OLlamaForCausalLM
 
 
 logging.basicConfig(
@@ -65,6 +65,7 @@ MAX_LENGTH = int(10000)  # Hardcoded max length to avoid infinite loop
 MODEL_CLASSES = {
     "opt-llama": (OptLlamaForCausalLM, LlamaTokenizer),
     "cla-llama": (ClaLlamaForCausalLM, LlamaTokenizer),
+    "h2o-llama": (H2OLlamaForCausalLM, LlamaTokenizer),
     "gpt2": (GPT2LMHeadModel, GPT2Tokenizer),
     "ctrl": (CTRLLMHeadModel, CTRLTokenizer),
     "openai-gpt": (OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
@@ -384,9 +385,12 @@ def main():
         logger.info(f"Overriding config: {args.config_overrides}")
         config.update_from_string(args.config_overrides)
         logger.info(f"New config: {config}")
-    import os
-    if os.environ.get('LCKV_FLASH_ATTN', False):
-        config._flash_attn_2_enabled = True
+    import os, sys
+    flash_attn_2_enabled = os.environ['LCKV_FLASH_ATTN']
+    print(flash_attn_2_enabled, file=sys.stderr)
+    flash_attn_2_enabled = True if (flash_attn_2_enabled == '1' or flash_attn_2_enabled == "True" or flash_attn_2_enabled == "true") else False
+    if not flash_attn_2_enabled:
+        config._flash_attn_2_enabled = False
     torch_dtype = (
         args.torch_dtype
         if args.torch_dtype in ["auto", None]
